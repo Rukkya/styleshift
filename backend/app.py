@@ -12,11 +12,39 @@ import os
 import uuid
 import logging
 import uvicorn
-from typing import List, Optional
-import json
+from typing import List
 from datetime import datetime
 import asyncio
-from models.cycle_gan_model import CycleGANModel
+
+# Define CycleGAN Generator
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_features, in_features, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, in_features, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.InstanceNorm2d(in_features)
+        )
+    
+    def forward(self, x):
+        return x + self.block(x)
+
+class Generator(nn.Module):
+    def __init__(self, input_nc=3, output_nc=3, n_residual_blocks=9):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(input_nc, 64, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+            *[ResidualBlock(64) for _ in range(n_residual_blocks)],
+            nn.Conv2d(64, output_nc, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.Tanh()
+        )
+    
+    def forward(self, x):
+        return self.model(x)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +58,7 @@ app = FastAPI(title="StyleShift API",
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,131 +72,65 @@ os.makedirs("backend/models", exist_ok=True)
 # Mount static files directory
 app.mount("/images", StaticFiles(directory="backend/results"), name="images")
 
-# In-memory database for demo purposes (would be Cassandra in production)
+# In-memory style database
 style_db = {
-    "s1": {
-        "id": "s1",
-        "name": "Monochrome",
-        "description": "Classic black and white style",
-        "model_path": "backend/models/monochrome_cyclegan.pth"
-    },
-    "s2": {
-        "id": "s2",
-        "name": "Vintage",
-        "description": "Retro-inspired warm tones",
-        "model_path": "backend/models/vintage_cyclegan.pth"
-    },
-    "s3": {
-        "id": "s3",
-        "name": "Nature",
-        "description": "Earthy green environment",
-        "model_path": "backend/models/nature_cyclegan.pth"
-    },
-    "s4": {
-        "id": "s4",
-        "name": "Neon",
-        "description": "Vibrant pink urban style",
-        "model_path": "backend/models/neon_cyclegan.pth"
-    }
+    "s1": {"id": "s1", "name": "Monochrome", "model_path": "backend/models/monochrome_cyclegan.pth"},
+    "s2": {"id": "s2", "name": "Vintage", "model_path": "backend/models/vintage_cyclegan.pth"},
+    "s3": {"id": "s3", "name": "Nature", "model_path": "backend/models/nature_cyclegan.pth"},
+    "s4": {"id": "s4", "name": "Neon", "model_path": "backend/models/neon_cyclegan.pth"},
 }
 
-# Request models
+# Request model
 class StyleTransferRequest(BaseModel):
     product_id: str
     style_id: str
-    
-class StyleResponse(BaseModel):
-    id: str
-    name: str
-    description: str
 
-class ProductStyleResponse(BaseModel):
-    id: str
-    product_id: str
-    style_id: str
-    image_url: str
-    created_at: str
-
-# Load pretrained CycleGAN model
+# Load CycleGAN generator model
 def load_model(style_id: str):
     try:
-        # In a real implementation, we would load the actual model
-        # For this demo, we'll simulate the model loading
-        logger.info(f"Loading model for style {style_id}: {style_db[style_id]['name']}")
-        
-        # Create a dummy model for demonstration
-        model = CycleGANModel()
-        
-        # In a real implementation, we would load weights like this:
-        # model.load_state_dict(torch.load(style_db[style_id]['model_path']))
-        
+        model = Generator()
+        model.load_state_dict(torch.load(style_db[style_id]['model_path'], map_location=torch.device('cpu')))
+        model.eval()
         return model
     except Exception as e:
         logger.error(f"Error loading model: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading model: {str(e)}")
 
-# Process image with CycleGAN
+# Apply CycleGAN for style transfer
 async def process_image(input_path: str, output_path: str, style_id: str):
     try:
-        # Load the image
         img = Image.open(input_path).convert('RGB')
-        
-        # Preprocess the image
-        preprocess = transforms.Compose([
+        transform = transforms.Compose([
             transforms.Resize(256),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        img_tensor = preprocess(img).unsqueeze(0)
+        img_tensor = transform(img).unsqueeze(0)
         
-        # Load the model
         model = load_model(style_id)
+        with torch.no_grad():
+            output_tensor = model(img_tensor)
         
-        # In a real implementation, we would run inference
-        # For this demo, we'll simulate the style transfer
-        logger.info(f"Applying style transfer with style {style_id}")
-        await asyncio.sleep(2)  # Simulate processing time
-        
-        # For demo purposes, just save the original image
-        # In a real implementation, we would save the transformed image
-        img.save(output_path)
-        
-        logger.info(f"Style transfer complete, saved to {output_path}")
+        output_img = output_tensor.squeeze().detach().numpy()
+        output_img = ((output_img + 1) / 2 * 255).astype('uint8')
+        output_img = Image.fromarray(output_img.transpose(1, 2, 0))
+        output_img.save(output_path)
         return True
     except Exception as e:
         logger.error(f"Error in style transfer: {e}")
         return False
 
 # API Endpoints
-@app.get("/")
-async def root():
-    return {"message": "Welcome to StyleShift API"}
-
-@app.get("/api/styles", response_model=List[StyleResponse])
-async def get_styles():
-    return [
-        {"id": style["id"], "name": style["name"], "description": style["description"]}
-        for style in style_db.values()
-    ]
-
-@app.post("/api/transfer", response_model=ProductStyleResponse)
+@app.post("/api/transfer")
 async def transfer_style(request: StyleTransferRequest, background_tasks: BackgroundTasks):
     try:
-        # Generate unique ID for this transfer
         transfer_id = str(uuid.uuid4())
-        
-        # In a real implementation, we would get the product image from a database
-        # For this demo, we'll use a placeholder path
         input_path = f"src/assets/products/{request.product_id}.jpg"
-        
-        # Create output path
         output_filename = f"{request.product_id}_{request.style_id}_{transfer_id}.jpg"
         output_path = f"backend/results/{output_filename}"
         
-        # Process the image in the background
         background_tasks.add_task(process_image, input_path, output_path, request.style_id)
         
-        # Return response with URL to the result
         return {
             "id": transfer_id,
             "product_id": request.product_id,
@@ -179,10 +141,6 @@ async def transfer_style(request: StyleTransferRequest, background_tasks: Backgr
     except Exception as e:
         logger.error(f"Error in style transfer: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
